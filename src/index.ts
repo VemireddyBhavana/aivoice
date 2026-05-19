@@ -5,6 +5,7 @@ import cors from 'cors';
 import { config } from './config';
 import { prisma } from './db';
 import { twilioRouter } from './routes/twilio';
+import { whatsappRouter } from './routes/whatsapp';
 import { createDeepgramLiveStream } from './services/deepgram';
 import { synthesizeSpeechStream, streamAudioToTwilio } from './services/elevenlabs';
 import { generateAIResponse } from './services/claude';
@@ -16,6 +17,7 @@ app.use(express.urlencoded({ extended: true }));
 
 // Mount Twilio REST endpoints
 app.use('/api/twilio', twilioRouter);
+app.use('/api/whatsapp', whatsappRouter);
 
 // Express Healthcheck
 app.get('/api/health', (req, res) => {
