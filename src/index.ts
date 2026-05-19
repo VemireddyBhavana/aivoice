@@ -3,9 +3,11 @@ import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import cors from 'cors';
 import { config } from './config';
+import { prisma } from './db';
 import { twilioRouter } from './routes/twilio';
 import { createDeepgramLiveStream } from './services/deepgram';
 import { synthesizeSpeechStream, streamAudioToTwilio } from './services/elevenlabs';
+import { generateAIResponse } from './services/claude';
 
 const app = express();
 app.use(cors());
@@ -34,24 +36,29 @@ const wss = new WebSocketServer({ noServer: true });
 wss.on('connection', (ws: WebSocket, request) => {
   console.log('[WebSocket] Client connected');
   let streamSid = '';
+  let callSid = '';
   let deepgramWs: WebSocket | null = null;
 
   // Handles finalized text transcribed by Deepgram
   const handleTranscript = async (transcript: string) => {
     try {
-      console.log(`[WebSocket Pipeline] Processing transcript: "${transcript}"`);
+      console.log(`[WebSocket Pipeline] Inbound speech transcript: "${transcript}"`);
       
-      // Phase 2 Closed-Loop Test Response (will be replaced by Claude LLM in Phase 3)
-      const testAckText = `I heard you say: ${transcript}. How else can I help you today?`;
+      // Dispatch transcript to the Claude AI Conversational Brain!
+      const aiReply = await generateAIResponse(callSid, transcript);
+      console.log(`[WebSocket Pipeline] Claude speech response: "${aiReply}"`);
       
-      const audioBuffer = await synthesizeSpeechStream(testAckText);
+      // Synthesize response speech via ElevenLabs
+      const audioBuffer = await synthesizeSpeechStream(aiReply);
+      
+      // Play back synthesized speech down Twilio stream in real-time
       await streamAudioToTwilio(ws, streamSid, audioBuffer);
     } catch (err) {
-      console.error('[WebSocket Pipeline] Error in closed-loop voice response:', err);
+      console.error('[WebSocket Pipeline] Error executing Claude voice cycle:', err);
     }
   };
 
-  ws.on('message', (message: string) => {
+  ws.on('message', async (message: string) => {
     try {
       const data = JSON.parse(message);
       
@@ -62,8 +69,60 @@ wss.on('connection', (ws: WebSocket, request) => {
           
         case 'start':
           streamSid = data.start.streamSid;
-          console.log(`[WebSocket] Starting media stream. StreamSid: ${streamSid}, CallSid: ${data.start.callSid}`);
+          callSid = data.start.callSid;
+          console.log(`[WebSocket] Starting media stream. StreamSid: ${streamSid}, CallSid: ${callSid}`);
           
+          const customerPhone = data.start.customParameters?.from || '+919999988888';
+          const merchantId = 'test-merchant-1234';
+
+          try {
+            console.log(`[WebSocket Setup] Initializing PostgreSQL session records for CallSid: ${callSid}`);
+            
+            // 1. Safely guarantee that the test merchant profile exists
+            await prisma.merchant.upsert({
+              where: { id: merchantId },
+              update: {},
+              create: {
+                id: merchantId,
+                name: 'Chai & Chutney',
+                phone: '+919876543210',
+              },
+            });
+
+            // 2. Instantiate dynamic customer session record
+            await prisma.customerSession.upsert({
+              where: { id: callSid },
+              update: {
+                activeCart: { items: [] },
+                currentState: 'GREETING',
+                address: null,
+              },
+              create: {
+                id: callSid,
+                merchantId: merchantId,
+                customerPhone: customerPhone,
+                channel: 'VOICE',
+                activeCart: { items: [] },
+                currentState: 'GREETING',
+              },
+            });
+
+            // 3. Create active dialog logs record
+            await prisma.callLog.upsert({
+              where: { id: callSid },
+              update: { transcript: [] },
+              create: {
+                id: callSid,
+                sessionId: callSid,
+                transcript: [],
+              },
+            });
+
+            console.log(`[WebSocket Setup] Database session initialized successfully.`);
+          } catch (dbErr) {
+            console.error('[WebSocket Setup] Database session initiation failed:', dbErr);
+          }
+
           // Instantiate a fresh Deepgram transcription client for this call
           deepgramWs = createDeepgramLiveStream(handleTranscript);
           break;

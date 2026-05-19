@@ -1,0 +1,377 @@
+import Anthropic from '@anthropic-ai/sdk';
+import { config } from '../config';
+import { prisma } from '../db';
+
+const anthropic = new Anthropic({
+  apiKey: config.anthropicApiKey || 'dummy-key-to-compile',
+});
+
+// System persona prompt
+const SYSTEM_PROMPT = `You are Rahul, a warm, polite, and efficient AI phone ordering agent for the restaurant "Chai & Chutney". Your job is to take customer orders, manage their cart, capture their address, and verbally lock in the order for checkout.
+
+CRITICAL RULES FOR SPEECH INTERFACE:
+1. Speak in natural Hinglish (conversational Hindi mixed with English keywords). Keep your responses short and friendly. (e.g. "Sure sir, ek Paneer Butter Masala add kar diya hai. Kuch aur chahiye?")
+2. DO NOT output HTML, asterisks, bold characters, markdown, or bullet points in your speech response. Write text that sounds natural when spoken aloud.
+3. If the customer specifies items, always use the tool 'add_to_cart' to update their cart. If they ask to remove something, use 'remove_from_cart'.
+4. Do not assume or guess items that are not on the menu. If they ask for something not available, politely guide them to available options.
+5. Once they say they are done ordering, summarize their cart, ask for their delivery address, and once they provide it, verbally confirm all items, total, and address before triggering 'confirm_order'.
+6. Keep your responses under 2-3 sentences. Short conversational dialogue is essential for phone latency.`;
+
+// Conversational tools schema for Claude Haiku
+const CLAUDE_TOOLS: any[] = [
+  {
+    name: 'get_menu',
+    description: 'Fetches the complete restaurant food menu containing active items, pricing, and descriptions.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'add_to_cart',
+    description: 'Adds specified food items to the customer\'s active shopping cart.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        items: {
+          type: 'array',
+          description: 'List of items to add to the cart.',
+          items: {
+            type: 'object',
+            properties: {
+              name: {
+                type: 'string',
+                description: 'The food item name or variation specified by the user (e.g. "pbm", "naan", "garlic naan", "paneer butter").',
+              },
+              quantity: {
+                type: 'number',
+                description: 'The quantity of this item. Default is 1.',
+              },
+            },
+            required: ['name'],
+          },
+        },
+      },
+      required: ['items'],
+    },
+  },
+  {
+    name: 'remove_from_cart',
+    description: 'Removes specified items or reduces their quantities from the customer\'s cart.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        items: {
+          type: 'array',
+          description: 'List of items to remove from the cart.',
+          items: {
+            type: 'object',
+            properties: {
+              name: {
+                type: 'string',
+                description: 'The name or phonetic alias of the item to remove.',
+              },
+            },
+            required: ['name'],
+          },
+        },
+      },
+      required: ['items'],
+    },
+  },
+  {
+    name: 'confirm_order',
+    description: 'Locks the customer\'s cart, registers their delivery address, calculates total with taxes, and creates the finalized checkout order record.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        address: {
+          type: 'string',
+          description: 'The customer\'s delivery address provided verbally during the call.',
+        },
+      },
+      required: ['address'],
+    },
+  },
+];
+
+/**
+ * Fuzzy matches a customer input against all seeded menu items (evaluating names & alias arrays).
+ * @param query The item phrase specified by the customer.
+ * @param menuList The list of available database MenuItem entries.
+ */
+function findMatchingMenuItem(query: string, menuList: any[]) {
+  const normalizedQuery = query.toLowerCase().trim();
+
+  // Try exact or substring match on item name first
+  let match = menuList.find(
+    (item) =>
+      item.name.toLowerCase() === normalizedQuery ||
+      item.name.toLowerCase().includes(normalizedQuery)
+  );
+
+  if (match) return match;
+
+  // Try matching inside the seeded alias array
+  match = menuList.find((item) =>
+    item.aliases.some(
+      (alias: string) =>
+        alias.toLowerCase() === normalizedQuery ||
+        normalizedQuery.includes(alias.toLowerCase())
+    )
+  );
+
+  return match;
+}
+
+/**
+ * Orchestrates customer transcripts through Claude tool calls and saves conversation records.
+ * @param sessionId The active phone Call SID or WhatsApp number.
+ * @param userText The customer transcript.
+ */
+export async function generateAIResponse(sessionId: string, userText: string): Promise<string> {
+  console.log(`[Claude Brain] Processing sessionId: ${sessionId}, input: "${userText}"`);
+
+  // 1. Fetch active session state from database
+  let session = await prisma.customerSession.findUnique({
+    where: { id: sessionId },
+    include: { merchant: true },
+  });
+
+  if (!session) {
+    throw new Error(`Session with ID ${sessionId} not initialized in database.`);
+  }
+
+  // 2. Fetch conversation history from CallLog transcripts to give AI short-term context memory
+  const callLog = await prisma.callLog.findFirst({
+    where: { sessionId: session.id },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  let messageHistory: Anthropic.MessageParam[] = [];
+  let transcriptList: any[] = [];
+
+  if (callLog && callLog.transcript) {
+    try {
+      transcriptList = callLog.transcript as any[];
+      // Map historical dialog exchanges into Claude thread format
+      transcriptList.forEach((msg: any) => {
+        messageHistory.push({
+          role: msg.role === 'customer' ? 'user' : 'assistant',
+          content: msg.text,
+        });
+      });
+    } catch (e) {
+      console.error('[Claude Brain] Error loading transcript history:', e);
+    }
+  }
+
+  // Append the latest customer text
+  messageHistory.push({ role: 'user', content: userText });
+  transcriptList.push({ role: 'customer', text: userText, time: new Date().toISOString() });
+
+  let loopsRemaining = 5; // Prevent tool calling infinite loops
+  let finalResponseText = '';
+  let activeCart: any = typeof session.activeCart === 'string' ? JSON.parse(session.activeCart) : session.activeCart;
+
+  while (loopsRemaining > 0) {
+    loopsRemaining--;
+
+    // Inject active cart context dynamically into system message
+    const dynamicSystemContext = `${SYSTEM_PROMPT}
+
+CURRENT SESSION ENVIRONMENT:
+- Merchant Name: "${session.merchant.name}"
+- Customer Phone: "${session.customerPhone}"
+- Active Cart: ${JSON.stringify(activeCart.items)}
+- Current State: "${session.currentState}"
+- Delivery Address: "${session.address || 'Not Provided'}"`;
+
+    // Request Claude Haiku response
+    const response = await anthropic.messages.create({
+      model: 'claude-3-haiku-20240307',
+      max_tokens: 450,
+      system: dynamicSystemContext,
+      messages: messageHistory,
+      tools: CLAUDE_TOOLS,
+    });
+
+    // Check if Claude requested a tool execution
+    const toolUse = response.content.find((c) => c.type === 'tool_use');
+
+    if (toolUse && toolUse.type === 'tool_use') {
+      const toolCall = toolUse as any;
+      console.log(`[Claude Brain] Tool execution requested: ${toolCall.name}`, toolCall.input);
+
+      // Append assistant's tool-request block to message history
+      messageHistory.push({ role: 'assistant', content: response.content as any });
+
+      let toolOutput = '';
+
+      try {
+        const menu = await prisma.menuItem.findMany({
+          where: { merchantId: session.merchantId, isAvailable: true },
+        });
+
+        switch (toolCall.name) {
+          case 'get_menu': {
+            const formattedMenu = menu.map((m) => `${m.name} - ₹${m.price} (${m.description || ''})`).join('\n');
+            toolOutput = `Available Menu:\n${formattedMenu}`;
+            break;
+          }
+
+          case 'add_to_cart': {
+            const inputItems = (toolCall.input as any).items || [];
+            const added: string[] = [];
+            const failed: string[] = [];
+
+            for (const item of inputItems) {
+              const matchedItem = findMatchingMenuItem(item.name, menu);
+              if (matchedItem) {
+                const qty = item.quantity || 1;
+                const existingIdx = activeCart.items.findIndex((i: any) => i.menuItemId === matchedItem.id);
+
+                if (existingIdx > -1) {
+                  activeCart.items[existingIdx].quantity += qty;
+                } else {
+                  activeCart.items.push({
+                    menuItemId: matchedItem.id,
+                    name: matchedItem.name,
+                    price: matchedItem.price,
+                    quantity: qty,
+                  });
+                }
+                added.push(`${qty}x ${matchedItem.name}`);
+              } else {
+                failed.push(item.name);
+              }
+            }
+
+            // Sync updated cart back to active database session
+            await prisma.customerSession.update({
+              where: { id: session.id },
+              data: { activeCart: activeCart, currentState: 'ORDERING' },
+            });
+
+            toolOutput = `Added to cart: ${added.join(', ')}.${failed.length ? ` Could not find: ${failed.join(', ')}.` : ''}`;
+            break;
+          }
+
+          case 'remove_from_cart': {
+            const inputItems = (toolCall.input as any).items || [];
+            const removed: string[] = [];
+
+            for (const item of inputItems) {
+              const matchedItem = findMatchingMenuItem(item.name, menu);
+              if (matchedItem) {
+                const existingIdx = activeCart.items.findIndex((i: any) => i.menuItemId === matchedItem.id);
+                if (existingIdx > -1) {
+                  removed.push(activeCart.items[existingIdx].name);
+                  activeCart.items.splice(existingIdx, 1);
+                }
+              }
+            }
+
+            await prisma.customerSession.update({
+              where: { id: session.id },
+              data: { activeCart: activeCart },
+            });
+
+            toolOutput = `Removed from cart: ${removed.join(', ')}.`;
+            break;
+          }
+
+          case 'confirm_order': {
+            const deliveryAddress = (toolCall.input as any).address || '';
+            if (activeCart.items.length === 0) {
+              toolOutput = 'Error: Cannot confirm order. Cart is empty!';
+              break;
+            }
+
+            // Calculate totals
+            const subtotal = activeCart.items.reduce((sum: number, i: any) => sum + i.price * i.quantity, 0);
+            const tax = subtotal * 0.05; // 5% CGST + SGST total tax
+            const total = subtotal + tax;
+
+            // Register confirmed checkout Order
+            const createdOrder = await prisma.order.create({
+              data: {
+                merchantId: session.merchantId,
+                customerPhone: session.customerPhone,
+                channel: session.channel,
+                items: activeCart.items,
+                subtotal,
+                tax,
+                total,
+                address: deliveryAddress,
+                paymentStatus: 'PENDING',
+                deliveryStatus: 'RECEIVED',
+              },
+            });
+
+            // Lock session state to COMPLETED
+            await prisma.customerSession.update({
+              where: { id: session.id },
+              data: {
+                currentState: 'COMPLETED',
+                address: deliveryAddress,
+                activeCart: { items: [] }, // Reset cart
+              },
+            });
+
+            console.log(`[Order Lock Successful] Created Order: ${createdOrder.id}`);
+            toolOutput = `Order placed successfully! Order ID: ${createdOrder.id}, Subtotal: ₹${subtotal}, Tax: ₹${tax}, Total: ₹${total}. Delivery address recorded: "${deliveryAddress}".`;
+            break;
+          }
+
+          default:
+            toolOutput = `Unknown tool: ${toolCall.name}`;
+            break;
+        }
+      } catch (err: any) {
+        console.error('[Claude Brain] Error executing tool:', err);
+        toolOutput = `Error executing tool: ${err.message}`;
+      }
+
+      console.log(`[Claude Brain] Tool execution results: ${toolOutput}`);
+
+      // Feed tool output back to Claude
+      messageHistory.push({
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: toolCall.id,
+            content: toolOutput,
+          },
+        ],
+      });
+    } else {
+      // Claude returned a final speech response
+      const textBlock = response.content.find((c) => c.type === 'text');
+      finalResponseText = textBlock && textBlock.type === 'text' ? textBlock.text : 'I did not catch that. Can you repeat?';
+      break;
+    }
+  }
+
+  // 4. Update the call logs transcript in database
+  transcriptList.push({ role: 'ai', text: finalResponseText, time: new Date().toISOString() });
+
+  if (callLog) {
+    await prisma.callLog.update({
+      where: { id: callLog.id },
+      data: { transcript: transcriptList },
+    });
+  } else {
+    // Scaffold call log entry if somehow missing
+    await prisma.callLog.create({
+      data: {
+        id: sessionId,
+        sessionId: session.id,
+        transcript: transcriptList,
+      },
+    });
+  }
+
+  return finalResponseText;
+}
