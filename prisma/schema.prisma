@@ -1,0 +1,95 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Channel {
+  VOICE
+  WHATSAPP
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+}
+
+enum DeliveryStatus {
+  RECEIVED
+  PREPARING
+  DISPATCHED
+  DELIVERED
+}
+
+model Merchant {
+  id        String   @id @default(uuid())
+  name      String
+  phone     String
+  apiKey    String   @default(uuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  menuItems MenuItem[]
+  orders    Order[]
+  sessions  CustomerSession[]
+}
+
+model MenuItem {
+  id          String   @id @default(uuid())
+  merchantId  String
+  merchant    Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  name        String
+  price       Float
+  description String?
+  aliases     String[] // Fuzzy matching variations (e.g. ["pbm", "paneer butter"])
+  isAvailable Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model CustomerSession {
+  id            String   @id // Can be Twilio Call SID or WhatsApp customer phone number
+  merchantId    String
+  merchant      Merchant @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  customerPhone String
+  channel       Channel
+  activeCart    Json     @default("{\"items\": []}") // { items: [{ menuItemId: String, name: String, price: Float, quantity: Int }] }
+  currentState  String   @default("GREETING") // GREETING, ORDERING, VERIFYING, ADDRESS, PAYMENT, COMPLETED
+  address       String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  callLogs      CallLog[]
+}
+
+model Order {
+  id            String         @id @default(uuid())
+  merchantId    String
+  merchant      Merchant       @relation(fields: [merchantId], references: [id], onDelete: Cascade)
+  customerPhone String
+  channel       Channel
+  items         Json           // Array of final ordered items
+  subtotal      Float
+  tax           Float
+  total         Float
+  address       String
+  paymentStatus PaymentStatus  @default(PENDING)
+  paymentLinkId String?
+  deliveryStatus DeliveryStatus @default(RECEIVED)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+}
+
+model CallLog {
+  id           String          @id // Twilio Call SID
+  sessionId    String
+  session      CustomerSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  recordingUrl String?
+  transcript   Json?           // Array of conversation exchange: [{ role: "customer"|"ai", text: String, time: String }]
+  duration     Int?
+  createdAt    DateTime        @default(now())
+}
