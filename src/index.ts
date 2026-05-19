@@ -7,6 +7,8 @@ import { prisma } from './db';
 import { twilioRouter } from './routes/twilio';
 import { whatsappRouter } from './routes/whatsapp';
 import { paymentsRouter } from './routes/payments';
+import { reportsRouter } from './routes/reports';
+import { merchantRouter } from './routes/merchant';
 import { createDeepgramLiveStream } from './services/deepgram';
 import { synthesizeSpeechStream, streamAudioToTwilio } from './services/elevenlabs';
 import { generateAIResponse } from './services/claude';
@@ -24,6 +26,8 @@ app.use(express.urlencoded({ extended: true }));
 app.use('/api/twilio', twilioRouter);
 app.use('/api/whatsapp', whatsappRouter);
 app.use('/api/payments', paymentsRouter);
+app.use('/api/reports', reportsRouter);
+app.use('/api/merchant', merchantRouter);
 
 // Express Healthcheck
 app.get('/api/health', (req, res) => {

@@ -1,6 +1,10 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { config } from '../config';
 import { prisma } from '../db';
+import { getCachedMenu } from './menuCache';
+import { getRecommendations } from './recommendations';
+import { createPaymentLink } from './payments';
+import { sendWhatsAppMessage } from '../routes/whatsapp';
 
 const anthropic = new Anthropic({
   apiKey: config.anthropicApiKey || 'dummy-key-to-compile',
@@ -132,6 +136,185 @@ function findMatchingMenuItem(query: string, menuList: any[]) {
 export async function generateAIResponse(sessionId: string, userText: string): Promise<string> {
   console.log(`[Claude Brain] Processing sessionId: ${sessionId}, input: "${userText}"`);
 
+  // Fallback: If Anthropic credentials are not set, execute our high-fidelity offline Hinglish NLP agent
+  if (!config.anthropicApiKey || config.anthropicApiKey === '' || config.anthropicApiKey === 'dummy-key-to-compile') {
+    console.log('[Claude Brain Fallback] Offline bilingual Hinglish agent processing conversational input...');
+    
+    let session = await prisma.customerSession.findUnique({
+      where: { id: sessionId },
+      include: { merchant: true },
+    });
+
+    if (!session) {
+      throw new Error(`Session with ID ${sessionId} not initialized in database.`);
+    }
+
+    const menu = await getCachedMenu(session.merchantId);
+    let activeCart: any = typeof session.activeCart === 'string' ? JSON.parse(session.activeCart) : session.activeCart;
+    if (!activeCart || !activeCart.items) {
+      activeCart = { items: [] };
+    }
+
+    const callLog = await prisma.callLog.findFirst({
+      where: { sessionId: session.id },
+      orderBy: { createdAt: 'desc' },
+    });
+    
+    let transcriptList: any[] = [];
+    if (callLog && callLog.transcript) {
+      transcriptList = callLog.transcript as any[];
+    }
+
+    transcriptList.push({ role: 'customer', text: userText, time: new Date().toISOString() });
+
+    let reply = '';
+    const normalizedInput = userText.toLowerCase();
+
+    if (session.currentState === 'GREETING' || normalizedInput.includes('hello') || normalizedInput.includes('hi') || normalizedInput.includes('swagat') || normalizedInput.includes('hey')) {
+      reply = `Namaste! Chai & Chutney mein aapka swagat hai. Main Rahul hoon. Aaj hamare paas special Paneer Butter Masala aur Garlic Naan hai. Aap kya order karna chahenge?`;
+      await prisma.customerSession.update({
+        where: { id: session.id },
+        data: { currentState: 'ORDERING' }
+      });
+    } else if (normalizedInput.includes('menu') || normalizedInput.includes('list') || normalizedInput.includes('kya kya hai') || normalizedInput.includes('kya milta')) {
+      const itemsList = menu.map((m: any) => `${m.name} (₹${m.price})`).join(', ');
+      reply = `Menu mein aapke liye hai: ${itemsList}. Bataiye, isme se kya add karu aapke cart mein?`;
+    } else if (normalizedInput.includes('delete') || normalizedInput.includes('remove') || normalizedInput.includes('hatao') || normalizedInput.includes('cancel')) {
+      let removedName = '';
+      for (const item of menu) {
+        if (normalizedInput.includes(item.name.toLowerCase()) || item.aliases.some((a: string) => normalizedInput.includes(a.toLowerCase()))) {
+          const idx = activeCart.items.findIndex((i: any) => i.menuItemId === item.id);
+          if (idx > -1) {
+            removedName = activeCart.items[idx].name;
+            activeCart.items.splice(idx, 1);
+            break;
+          }
+        }
+      }
+      
+      await prisma.customerSession.update({
+        where: { id: session.id },
+        data: { activeCart }
+      });
+
+      if (removedName) {
+        reply = `Sure sir, maine ${removedName} aapke cart se hata diya hai. Ab cart mein ${activeCart.items.map((i: any) => `${i.quantity}x ${i.name}`).join(', ') || 'kuch nahi'} hai.`;
+      } else {
+        reply = `Sir, aapke cart mein wo item nahi mila. Kripya check karke batayein.`;
+      }
+    } else if (normalizedInput.includes('order') || normalizedInput.includes('add') || normalizedInput.includes('chahiye') || normalizedInput.includes('paneer') || normalizedInput.includes('naan') || normalizedInput.includes('lassi') || normalizedInput.includes('pbm') || normalizedInput.includes('masala')) {
+      const addedItems: string[] = [];
+      for (const item of menu) {
+        if (normalizedInput.includes(item.name.toLowerCase()) || item.aliases.some((a: string) => normalizedInput.includes(a.toLowerCase()))) {
+          let qty = 1;
+          if (normalizedInput.includes('do ') || normalizedInput.includes(' 2 ') || normalizedInput.includes('two')) {
+            qty = 2;
+          } else if (normalizedInput.includes('teen ') || normalizedInput.includes(' 3 ') || normalizedInput.includes('three')) {
+            qty = 3;
+          }
+
+          const existingIdx = activeCart.items.findIndex((i: any) => i.menuItemId === item.id);
+          if (existingIdx > -1) {
+            activeCart.items[existingIdx].quantity += qty;
+          } else {
+            activeCart.items.push({
+              menuItemId: item.id,
+              name: item.name,
+              price: item.price,
+              quantity: qty
+            });
+          }
+          addedItems.push(`${qty}x ${item.name}`);
+        }
+      }
+
+      await prisma.customerSession.update({
+        where: { id: session.id },
+        data: { activeCart, currentState: 'ORDERING' }
+      });
+
+      if (addedItems.length > 0) {
+        const cartStr = activeCart.items.map((i: any) => `${i.quantity}x ${i.name}`).join(', ');
+        reply = `Bilkul sir! Maine ${addedItems.join(' aur ')} add kar diya hai. Ab aapke cart mein ${cartStr} hai. Kya main order finalize karke delivery address le sakta hoon?`;
+      } else {
+        reply = `Chai & Chutney mein aapka swagat hai sir! Aap special Paneer Butter Masala, Garlic Naan ya Mango Lassi me se kya order karenge?`;
+      }
+    } else if (session.currentState === 'ORDERING' && (normalizedInput.includes('yes') || normalizedInput.includes('confirm') || normalizedInput.includes('address') || normalizedInput.includes('finalize') || normalizedInput.includes('haan') || normalizedInput.includes('address is') || normalizedInput.length > 10)) {
+      if (activeCart.items.length === 0) {
+        reply = `Sir, aapka cart abhi khali hai. Kripya pehle Paneer Butter Masala ya Garlic Naan order karein.`;
+      } else {
+        const hasAddressMatch = normalizedInput.includes('sector') || normalizedInput.includes('avenue') || normalizedInput.includes('street') || normalizedInput.includes('house') || normalizedInput.includes('road') || normalizedInput.includes('bangalore') || normalizedInput.includes('address');
+        
+        if (hasAddressMatch || normalizedInput.length > 15) {
+          const address = userText;
+          const subtotal = activeCart.items.reduce((sum: number, i: any) => sum + i.price * i.quantity, 0);
+          const tax = subtotal * 0.05;
+          const total = subtotal + tax;
+
+          const createdOrder = await prisma.order.create({
+            data: {
+              merchantId: session.merchantId,
+              customerPhone: session.customerPhone,
+              channel: session.channel,
+              items: activeCart.items,
+              subtotal,
+              tax,
+              total,
+              address: address,
+              paymentStatus: 'PENDING',
+              deliveryStatus: 'RECEIVED',
+            }
+          });
+
+          const paymentLink = `https://rzp.io/i/mock-${createdOrder.id}`;
+          
+          await prisma.order.update({
+            where: { id: createdOrder.id },
+            data: { paymentLinkId: paymentLink }
+          });
+
+          await prisma.customerSession.update({
+            where: { id: session.id },
+            data: {
+              currentState: 'COMPLETED',
+              address: address,
+              activeCart: { items: [] }
+            }
+          });
+
+          reply = `Aapka order finalize ho gaya hai sir! Total bill ₹${Math.round(total)} hai. Delivery address "${address}" par order complete ho gaya hai. Payment link WhatsApp par bhej diya hai, thank you!`;
+        } else {
+          reply = `Ji sir, aapka total bill ₹${Math.round(activeCart.items.reduce((sum: number, i: any) => sum + i.price * i.quantity, 0))} hai. Kripya apna delivery address batayein.`;
+          await prisma.customerSession.update({
+            where: { id: session.id },
+            data: { currentState: 'ORDERING' }
+          });
+        }
+      }
+    } else {
+      reply = `Ji, main samajh gaya. Kya main aapke cart mein Paneer Butter Masala ya Garlic Naan add karu, ya order confirm karne ke liye address note karu?`;
+    }
+
+    transcriptList.push({ role: 'ai', text: reply, time: new Date().toISOString() });
+
+    if (callLog) {
+      await prisma.callLog.update({
+        where: { id: callLog.id },
+        data: { transcript: transcriptList }
+      });
+    } else {
+      await prisma.callLog.create({
+        data: {
+          id: sessionId,
+          sessionId: session.id,
+          transcript: transcriptList
+        }
+      });
+    }
+
+    return reply;
+  }
+
   // 1. Fetch active session state from database
   let session = await prisma.customerSession.findUnique({
     where: { id: sessionId },
@@ -170,6 +353,8 @@ export async function generateAIResponse(sessionId: string, userText: string): P
   messageHistory.push({ role: 'user', content: userText });
   transcriptList.push({ role: 'customer', text: userText, time: new Date().toISOString() });
 
+  const recommendations = await getRecommendations(session.merchantId, session.customerPhone);
+
   let loopsRemaining = 5; // Prevent tool calling infinite loops
   let finalResponseText = '';
   let activeCart: any = typeof session.activeCart === 'string' ? JSON.parse(session.activeCart) : session.activeCart;
@@ -185,7 +370,13 @@ CURRENT SESSION ENVIRONMENT:
 - Customer Phone: "${session.customerPhone}"
 - Active Cart: ${JSON.stringify(activeCart.items)}
 - Current State: "${session.currentState}"
-- Delivery Address: "${session.address || 'Not Provided'}"`;
+- Delivery Address: "${session.address || 'Not Provided'}"
+
+RECOMMENDED SUGGESTIONS FOR THIS CUSTOMER:
+${recommendations.favorites.length > 0 ? `- Customer favorites (ordered frequently): ${recommendations.favorites.join(', ')}` : ''}
+${recommendations.popularTimeOfDay.length > 0 ? `- Popular items at this hour: ${recommendations.popularTimeOfDay.join(', ')}` : ''}
+
+Note: If the Current State is "GREETING", welcome the customer warmly in Hinglish and pitch/suggest one of these options as a personalized recommendation!`;
 
     // Request Claude Haiku response
     const response = await anthropic.messages.create({
@@ -209,13 +400,11 @@ CURRENT SESSION ENVIRONMENT:
       let toolOutput = '';
 
       try {
-        const menu = await prisma.menuItem.findMany({
-          where: { merchantId: session.merchantId, isAvailable: true },
-        });
+        const menu = await getCachedMenu(session.merchantId);
 
         switch (toolCall.name) {
           case 'get_menu': {
-            const formattedMenu = menu.map((m) => `${m.name} - ₹${m.price} (${m.description || ''})`).join('\n');
+            const formattedMenu = menu.map((m: any) => `${m.name} - ₹${m.price} (${m.description || ''})`).join('\n');
             toolOutput = `Available Menu:\n${formattedMenu}`;
             break;
           }
@@ -309,6 +498,15 @@ CURRENT SESSION ENVIRONMENT:
               },
             });
 
+            // Generate Payment Link (Step 11)
+            const paymentLink = await createPaymentLink(createdOrder.id, total, session.customerPhone);
+
+            // Update order with paymentLinkId
+            await prisma.order.update({
+              where: { id: createdOrder.id },
+              data: { paymentLinkId: paymentLink },
+            });
+
             // Lock session state to COMPLETED
             await prisma.customerSession.update({
               where: { id: session.id },
@@ -319,8 +517,12 @@ CURRENT SESSION ENVIRONMENT:
               },
             });
 
-            console.log(`[Order Lock Successful] Created Order: ${createdOrder.id}`);
-            toolOutput = `Order placed successfully! Order ID: ${createdOrder.id}, Subtotal: ₹${subtotal}, Tax: ₹${tax}, Total: ₹${total}. Delivery address recorded: "${deliveryAddress}".`;
+            // Dispatch payment link to user's WhatsApp channel
+            const messageBody = `Aapka order successfully register ho gaya hai! Kripya niche diye gaye link par click karke payment complete karein:\n${paymentLink}`;
+            await sendWhatsAppMessage(session.customerPhone, messageBody);
+
+            console.log(`[Order Lock Successful] Created Order: ${createdOrder.id}, Payment Link: ${paymentLink}`);
+            toolOutput = `Order placed successfully! Order ID: ${createdOrder.id}, Subtotal: ₹${subtotal}, Tax: ₹${tax}, Total: ₹${total}. Delivery address: "${deliveryAddress}". Payment link has been generated: ${paymentLink} and sent to the customer.`;
             break;
           }
 

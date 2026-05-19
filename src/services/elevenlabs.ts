@@ -1,4 +1,6 @@
+import crypto from 'crypto';
 import { config } from '../config';
+import { redis } from './redis';
 
 /**
  * Synthesizes text into 8kHz Mulaw audio bytes using ElevenLabs Low-Latency API.
@@ -6,10 +8,25 @@ import { config } from '../config';
  * @returns Promise resolving to a Buffer of raw 8kHz Mulaw audio.
  */
 export async function synthesizeSpeechStream(text: string): Promise<Buffer> {
-  const voiceId = config.elevenlabsVoiceId;
+  const voiceId = config.elevenlabsVoiceId || 'default-voice';
+  
+  // Create MD5 hash of text & voice ID
+  const hash = crypto.createHash('md5').update(`${voiceId}:${text}`).digest('hex');
+  const cacheKey = `tts:${voiceId}:${hash}`;
+
+  try {
+    const cachedBuffer = await redis.getBuffer(cacheKey);
+    if (cachedBuffer) {
+      console.log(`[ElevenLabs] Cache hit for text: "${text.substring(0, 40)}..."`);
+      return cachedBuffer;
+    }
+  } catch (err) {
+    console.warn('[ElevenLabs] Failed to retrieve from cache:', err);
+  }
+
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`;
 
-  console.log(`[ElevenLabs] Dispatching synthesis request for: "${text}"`);
+  console.log(`[ElevenLabs] Cache miss. Dispatching synthesis request for: "${text}"`);
   
   if (!config.elevenlabsApiKey) {
     console.warn('[ElevenLabs] Warning: ELEVENLABS_API_KEY is not set. Synthesis will fail.');
@@ -37,7 +54,16 @@ export async function synthesizeSpeechStream(text: string): Promise<Buffer> {
   }
 
   const arrayBuffer = await response.arrayBuffer();
-  return Buffer.from(arrayBuffer);
+  const audioBuffer = Buffer.from(arrayBuffer);
+
+  try {
+    // Cache the buffer with 7 days TTL (604800 seconds)
+    await redis.setBuffer(cacheKey, audioBuffer, 604800);
+  } catch (err) {
+    console.warn('[ElevenLabs] Failed to write synthesis to cache:', err);
+  }
+
+  return audioBuffer;
 }
 
 /**
