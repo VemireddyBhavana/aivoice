@@ -3,11 +3,17 @@ import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import cors from 'cors';
 import { config } from './config';
+import { twilioRouter } from './routes/twilio';
+import { createDeepgramLiveStream } from './services/deepgram';
+import { synthesizeSpeechStream, streamAudioToTwilio } from './services/elevenlabs';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Mount Twilio REST endpoints
+app.use('/api/twilio', twilioRouter);
 
 // Express Healthcheck
 app.get('/api/health', (req, res) => {
@@ -28,6 +34,22 @@ const wss = new WebSocketServer({ noServer: true });
 wss.on('connection', (ws: WebSocket, request) => {
   console.log('[WebSocket] Client connected');
   let streamSid = '';
+  let deepgramWs: WebSocket | null = null;
+
+  // Handles finalized text transcribed by Deepgram
+  const handleTranscript = async (transcript: string) => {
+    try {
+      console.log(`[WebSocket Pipeline] Processing transcript: "${transcript}"`);
+      
+      // Phase 2 Closed-Loop Test Response (will be replaced by Claude LLM in Phase 3)
+      const testAckText = `I heard you say: ${transcript}. How else can I help you today?`;
+      
+      const audioBuffer = await synthesizeSpeechStream(testAckText);
+      await streamAudioToTwilio(ws, streamSid, audioBuffer);
+    } catch (err) {
+      console.error('[WebSocket Pipeline] Error in closed-loop voice response:', err);
+    }
+  };
 
   ws.on('message', (message: string) => {
     try {
@@ -37,17 +59,31 @@ wss.on('connection', (ws: WebSocket, request) => {
         case 'connected':
           console.log('[WebSocket] Media stream connection active');
           break;
+          
         case 'start':
           streamSid = data.start.streamSid;
           console.log(`[WebSocket] Starting media stream. StreamSid: ${streamSid}, CallSid: ${data.start.callSid}`);
+          
+          // Instantiate a fresh Deepgram transcription client for this call
+          deepgramWs = createDeepgramLiveStream(handleTranscript);
           break;
+          
         case 'media':
-          // Raw mulaw audio chunks from Twilio
-          // In the next milestone, this is piped to Deepgram
+          // Decodes the incoming mulaw base64 audio chunk from Twilio
+          if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) {
+            const rawAudio = Buffer.from(data.media.payload, 'base64');
+            deepgramWs.send(rawAudio);
+          }
           break;
+          
         case 'stop':
           console.log(`[WebSocket] Media stream stopped for StreamSid: ${streamSid}`);
+          if (deepgramWs) {
+            deepgramWs.close();
+            deepgramWs = null;
+          }
           break;
+          
         default:
           break;
       }
@@ -58,10 +94,18 @@ wss.on('connection', (ws: WebSocket, request) => {
 
   ws.on('close', () => {
     console.log(`[WebSocket] Client disconnected. StreamSid: ${streamSid}`);
+    if (deepgramWs) {
+      deepgramWs.close();
+      deepgramWs = null;
+    }
   });
 
   ws.on('error', (error) => {
     console.error(`[WebSocket] Error:`, error);
+    if (deepgramWs) {
+      deepgramWs.close();
+      deepgramWs = null;
+    }
   });
 });
 
