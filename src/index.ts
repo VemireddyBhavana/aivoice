@@ -6,18 +6,24 @@ import { config } from './config';
 import { prisma } from './db';
 import { twilioRouter } from './routes/twilio';
 import { whatsappRouter } from './routes/whatsapp';
+import { paymentsRouter } from './routes/payments';
 import { createDeepgramLiveStream } from './services/deepgram';
 import { synthesizeSpeechStream, streamAudioToTwilio } from './services/elevenlabs';
 import { generateAIResponse } from './services/claude';
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({
+  verify: (req: any, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 app.use(express.urlencoded({ extended: true }));
 
 // Mount Twilio REST endpoints
 app.use('/api/twilio', twilioRouter);
 app.use('/api/whatsapp', whatsappRouter);
+app.use('/api/payments', paymentsRouter);
 
 // Express Healthcheck
 app.get('/api/health', (req, res) => {

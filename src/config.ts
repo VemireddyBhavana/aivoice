@@ -14,5 +14,8 @@ export const config = {
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
   razorpayKeyId: process.env.RAZORPAY_KEY_ID || '',
   razorpayKeySecret: process.env.RAZORPAY_KEY_SECRET || '',
+  razorpayWebhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET || '',
+  kitchenWebhookUrl: process.env.KITCHEN_WEBHOOK_URL || '',
+  kitchenWebhookSecret: process.env.KITCHEN_WEBHOOK_SECRET || '',
   redisUrl: process.env.REDIS_URL || '',
 };
