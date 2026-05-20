@@ -136,8 +136,8 @@ function findMatchingMenuItem(query: string, menuList: any[]) {
 export async function generateAIResponse(sessionId: string, userText: string): Promise<string> {
   console.log(`[Claude Brain] Processing sessionId: ${sessionId}, input: "${userText}"`);
 
-  // Fallback: If Anthropic credentials are not set, execute our high-fidelity offline Hinglish NLP agent
-  if (!config.anthropicApiKey || config.anthropicApiKey === '' || config.anthropicApiKey === 'dummy-key-to-compile') {
+  // Local helper for offline Hinglish fallback
+  const executeOfflineFallback = async (): Promise<string> => {
     console.log('[Claude Brain Fallback] Offline bilingual Hinglish agent processing conversational input...');
     
     let session = await prisma.customerSession.findUnique({
@@ -313,57 +313,63 @@ export async function generateAIResponse(sessionId: string, userText: string): P
     }
 
     return reply;
+  };
+
+  // Fallback: If Anthropic credentials are not set, execute our high-fidelity offline Hinglish NLP agent
+  if (!config.anthropicApiKey || config.anthropicApiKey === '' || config.anthropicApiKey === 'dummy-key-to-compile') {
+    return executeOfflineFallback();
   }
 
-  // 1. Fetch active session state from database
-  let session = await prisma.customerSession.findUnique({
-    where: { id: sessionId },
-    include: { merchant: true },
-  });
+  try {
+    // 1. Fetch active session state from database
+    let session = await prisma.customerSession.findUnique({
+      where: { id: sessionId },
+      include: { merchant: true },
+    });
 
-  if (!session) {
-    throw new Error(`Session with ID ${sessionId} not initialized in database.`);
-  }
-
-  // 2. Fetch conversation history from CallLog transcripts to give AI short-term context memory
-  const callLog = await prisma.callLog.findFirst({
-    where: { sessionId: session.id },
-    orderBy: { createdAt: 'desc' },
-  });
-
-  let messageHistory: Anthropic.MessageParam[] = [];
-  let transcriptList: any[] = [];
-
-  if (callLog && callLog.transcript) {
-    try {
-      transcriptList = callLog.transcript as any[];
-      // Map historical dialog exchanges into Claude thread format
-      transcriptList.forEach((msg: any) => {
-        messageHistory.push({
-          role: msg.role === 'customer' ? 'user' : 'assistant',
-          content: msg.text,
-        });
-      });
-    } catch (e) {
-      console.error('[Claude Brain] Error loading transcript history:', e);
+    if (!session) {
+      throw new Error(`Session with ID ${sessionId} not initialized in database.`);
     }
-  }
 
-  // Append the latest customer text
-  messageHistory.push({ role: 'user', content: userText });
-  transcriptList.push({ role: 'customer', text: userText, time: new Date().toISOString() });
+    // 2. Fetch conversation history from CallLog transcripts to give AI short-term context memory
+    const callLog = await prisma.callLog.findFirst({
+      where: { sessionId: session.id },
+      orderBy: { createdAt: 'desc' },
+    });
 
-  const recommendations = await getRecommendations(session.merchantId, session.customerPhone);
+    let messageHistory: Anthropic.MessageParam[] = [];
+    let transcriptList: any[] = [];
 
-  let loopsRemaining = 5; // Prevent tool calling infinite loops
-  let finalResponseText = '';
-  let activeCart: any = typeof session.activeCart === 'string' ? JSON.parse(session.activeCart) : session.activeCart;
+    if (callLog && callLog.transcript) {
+      try {
+        transcriptList = callLog.transcript as any[];
+        // Map historical dialog exchanges into Claude thread format
+        transcriptList.forEach((msg: any) => {
+          messageHistory.push({
+            role: msg.role === 'customer' ? 'user' : 'assistant',
+            content: msg.text,
+          });
+        });
+      } catch (e) {
+        console.error('[Claude Brain] Error loading transcript history:', e);
+      }
+    }
 
-  while (loopsRemaining > 0) {
-    loopsRemaining--;
+    // Append the latest customer text
+    messageHistory.push({ role: 'user', content: userText });
+    transcriptList.push({ role: 'customer', text: userText, time: new Date().toISOString() });
 
-    // Inject active cart context dynamically into system message
-    const dynamicSystemContext = `${SYSTEM_PROMPT}
+    const recommendations = await getRecommendations(session.merchantId, session.customerPhone);
+
+    let loopsRemaining = 5; // Prevent tool calling infinite loops
+    let finalResponseText = '';
+    let activeCart: any = typeof session.activeCart === 'string' ? JSON.parse(session.activeCart) : session.activeCart;
+
+    while (loopsRemaining > 0) {
+      loopsRemaining--;
+
+      // Inject active cart context dynamically into system message
+      const dynamicSystemContext = `${SYSTEM_PROMPT}
 
 CURRENT SESSION ENVIRONMENT:
 - Merchant Name: "${session.merchant.name}"
@@ -378,202 +384,206 @@ ${recommendations.popularTimeOfDay.length > 0 ? `- Popular items at this hour: $
 
 Note: If the Current State is "GREETING", welcome the customer warmly in Hinglish and pitch/suggest one of these options as a personalized recommendation!`;
 
-    // Request Claude Haiku response
-    const response = await anthropic.messages.create({
-      model: 'claude-3-haiku-20240307',
-      max_tokens: 450,
-      system: dynamicSystemContext,
-      messages: messageHistory,
-      tools: CLAUDE_TOOLS,
-    });
+      // Request Claude Haiku response
+      const response = await anthropic.messages.create({
+        model: 'claude-3-haiku-20240307',
+        max_tokens: 450,
+        system: dynamicSystemContext,
+        messages: messageHistory,
+        tools: CLAUDE_TOOLS,
+      });
 
-    // Check if Claude requested a tool execution
-    const toolUse = response.content.find((c) => c.type === 'tool_use');
+      // Check if Claude requested a tool execution
+      const toolUse = response.content.find((c) => c.type === 'tool_use');
 
-    if (toolUse && toolUse.type === 'tool_use') {
-      const toolCall = toolUse as any;
-      console.log(`[Claude Brain] Tool execution requested: ${toolCall.name}`, toolCall.input);
+      if (toolUse && toolUse.type === 'tool_use') {
+        const toolCall = toolUse as any;
+        console.log(`[Claude Brain] Tool execution requested: ${toolCall.name}`, toolCall.input);
 
-      // Append assistant's tool-request block to message history
-      messageHistory.push({ role: 'assistant', content: response.content as any });
+        // Append assistant's tool-request block to message history
+        messageHistory.push({ role: 'assistant', content: response.content as any });
 
-      let toolOutput = '';
+        let toolOutput = '';
 
-      try {
-        const menu = await getCachedMenu(session.merchantId);
+        try {
+          const menu = await getCachedMenu(session.merchantId);
 
-        switch (toolCall.name) {
-          case 'get_menu': {
-            const formattedMenu = menu.map((m: any) => `${m.name} - ₹${m.price} (${m.description || ''})`).join('\n');
-            toolOutput = `Available Menu:\n${formattedMenu}`;
-            break;
-          }
-
-          case 'add_to_cart': {
-            const inputItems = (toolCall.input as any).items || [];
-            const added: string[] = [];
-            const failed: string[] = [];
-
-            for (const item of inputItems) {
-              const matchedItem = findMatchingMenuItem(item.name, menu);
-              if (matchedItem) {
-                const qty = item.quantity || 1;
-                const existingIdx = activeCart.items.findIndex((i: any) => i.menuItemId === matchedItem.id);
-
-                if (existingIdx > -1) {
-                  activeCart.items[existingIdx].quantity += qty;
-                } else {
-                  activeCart.items.push({
-                    menuItemId: matchedItem.id,
-                    name: matchedItem.name,
-                    price: matchedItem.price,
-                    quantity: qty,
-                  });
-                }
-                added.push(`${qty}x ${matchedItem.name}`);
-              } else {
-                failed.push(item.name);
-              }
-            }
-
-            // Sync updated cart back to active database session
-            await prisma.customerSession.update({
-              where: { id: session.id },
-              data: { activeCart: activeCart, currentState: 'ORDERING' },
-            });
-
-            toolOutput = `Added to cart: ${added.join(', ')}.${failed.length ? ` Could not find: ${failed.join(', ')}.` : ''}`;
-            break;
-          }
-
-          case 'remove_from_cart': {
-            const inputItems = (toolCall.input as any).items || [];
-            const removed: string[] = [];
-
-            for (const item of inputItems) {
-              const matchedItem = findMatchingMenuItem(item.name, menu);
-              if (matchedItem) {
-                const existingIdx = activeCart.items.findIndex((i: any) => i.menuItemId === matchedItem.id);
-                if (existingIdx > -1) {
-                  removed.push(activeCart.items[existingIdx].name);
-                  activeCart.items.splice(existingIdx, 1);
-                }
-              }
-            }
-
-            await prisma.customerSession.update({
-              where: { id: session.id },
-              data: { activeCart: activeCart },
-            });
-
-            toolOutput = `Removed from cart: ${removed.join(', ')}.`;
-            break;
-          }
-
-          case 'confirm_order': {
-            const deliveryAddress = (toolCall.input as any).address || '';
-            if (activeCart.items.length === 0) {
-              toolOutput = 'Error: Cannot confirm order. Cart is empty!';
+          switch (toolCall.name) {
+            case 'get_menu': {
+              const formattedMenu = menu.map((m: any) => `${m.name} - ₹${m.price} (${m.description || ''})`).join('\n');
+              toolOutput = `Available Menu:\n${formattedMenu}`;
               break;
             }
 
-            // Calculate totals
-            const subtotal = activeCart.items.reduce((sum: number, i: any) => sum + i.price * i.quantity, 0);
-            const tax = subtotal * 0.05; // 5% CGST + SGST total tax
-            const total = subtotal + tax;
+            case 'add_to_cart': {
+              const inputItems = (toolCall.input as any).items || [];
+              const added: string[] = [];
+              const failed: string[] = [];
 
-            // Register confirmed checkout Order
-            const createdOrder = await prisma.order.create({
-              data: {
-                merchantId: session.merchantId,
-                customerPhone: session.customerPhone,
-                channel: session.channel,
-                items: activeCart.items,
-                subtotal,
-                tax,
-                total,
-                address: deliveryAddress,
-                paymentStatus: 'PENDING',
-                deliveryStatus: 'RECEIVED',
-              },
-            });
+              for (const item of inputItems) {
+                const matchedItem = findMatchingMenuItem(item.name, menu);
+                if (matchedItem) {
+                  const qty = item.quantity || 1;
+                  const existingIdx = activeCart.items.findIndex((i: any) => i.menuItemId === matchedItem.id);
 
-            // Generate Payment Link (Step 11)
-            const paymentLink = await createPaymentLink(createdOrder.id, total, session.customerPhone);
+                  if (existingIdx > -1) {
+                    activeCart.items[existingIdx].quantity += qty;
+                  } else {
+                    activeCart.items.push({
+                      menuItemId: matchedItem.id,
+                      name: matchedItem.name,
+                      price: matchedItem.price,
+                      quantity: qty,
+                    });
+                  }
+                  added.push(`${qty}x ${matchedItem.name}`);
+                } else {
+                  failed.push(item.name);
+                }
+              }
 
-            // Update order with paymentLinkId
-            await prisma.order.update({
-              where: { id: createdOrder.id },
-              data: { paymentLinkId: paymentLink },
-            });
+              // Sync updated cart back to active database session
+              await prisma.customerSession.update({
+                where: { id: session.id },
+                data: { activeCart: activeCart, currentState: 'ORDERING' },
+              });
 
-            // Lock session state to COMPLETED
-            await prisma.customerSession.update({
-              where: { id: session.id },
-              data: {
-                currentState: 'COMPLETED',
-                address: deliveryAddress,
-                activeCart: { items: [] }, // Reset cart
-              },
-            });
+              toolOutput = `Added to cart: ${added.join(', ')}.${failed.length ? ` Could not find: ${failed.join(', ')}.` : ''}`;
+              break;
+            }
 
-            // Dispatch payment link to user's WhatsApp channel
-            const messageBody = `Aapka order successfully register ho gaya hai! Kripya niche diye gaye link par click karke payment complete karein:\n${paymentLink}`;
-            await sendWhatsAppMessage(session.customerPhone, messageBody);
+            case 'remove_from_cart': {
+              const inputItems = (toolCall.input as any).items || [];
+              const removed: string[] = [];
 
-            console.log(`[Order Lock Successful] Created Order: ${createdOrder.id}, Payment Link: ${paymentLink}`);
-            toolOutput = `Order placed successfully! Order ID: ${createdOrder.id}, Subtotal: ₹${subtotal}, Tax: ₹${tax}, Total: ₹${total}. Delivery address: "${deliveryAddress}". Payment link has been generated: ${paymentLink} and sent to the customer.`;
-            break;
+              for (const item of inputItems) {
+                const matchedItem = findMatchingMenuItem(item.name, menu);
+                if (matchedItem) {
+                  const existingIdx = activeCart.items.findIndex((i: any) => i.menuItemId === matchedItem.id);
+                  if (existingIdx > -1) {
+                    removed.push(activeCart.items[existingIdx].name);
+                    activeCart.items.splice(existingIdx, 1);
+                  }
+                }
+              }
+
+              await prisma.customerSession.update({
+                where: { id: session.id },
+                data: { activeCart: activeCart },
+              });
+
+              toolOutput = `Removed from cart: ${removed.join(', ')}.`;
+              break;
+            }
+
+            case 'confirm_order': {
+              const deliveryAddress = (toolCall.input as any).address || '';
+              if (activeCart.items.length === 0) {
+                toolOutput = 'Error: Cannot confirm order. Cart is empty!';
+                break;
+              }
+
+              // Calculate totals
+              const subtotal = activeCart.items.reduce((sum: number, i: any) => sum + i.price * i.quantity, 0);
+              const tax = subtotal * 0.05; // 5% CGST + SGST total tax
+              const total = subtotal + tax;
+
+              // Register confirmed checkout Order
+              const createdOrder = await prisma.order.create({
+                data: {
+                  merchantId: session.merchantId,
+                  customerPhone: session.customerPhone,
+                  channel: session.channel,
+                  items: activeCart.items,
+                  subtotal,
+                  tax,
+                  total,
+                  address: deliveryAddress,
+                  paymentStatus: 'PENDING',
+                  deliveryStatus: 'RECEIVED',
+                },
+              });
+
+              // Generate Payment Link (Step 11)
+              const paymentLink = await createPaymentLink(createdOrder.id, total, session.customerPhone);
+
+              // Update order with paymentLinkId
+              await prisma.order.update({
+                where: { id: createdOrder.id },
+                data: { paymentLinkId: paymentLink },
+              });
+
+              // Lock session state to COMPLETED
+              await prisma.customerSession.update({
+                where: { id: session.id },
+                data: {
+                  currentState: 'COMPLETED',
+                  address: deliveryAddress,
+                  activeCart: { items: [] }, // Reset cart
+                },
+              });
+
+              // Dispatch payment link to user's WhatsApp channel
+              const messageBody = `Aapka order successfully register ho gaya hai! Kripya niche diye gaye link par click karke payment complete karein:\n${paymentLink}`;
+              await sendWhatsAppMessage(session.customerPhone, messageBody);
+
+              console.log(`[Order Lock Successful] Created Order: ${createdOrder.id}, Payment Link: ${paymentLink}`);
+              toolOutput = `Order placed successfully! Order ID: ${createdOrder.id}, Subtotal: ₹${subtotal}, Tax: ₹${tax}, Total: ₹${total}. Delivery address: "${deliveryAddress}". Payment link has been generated: ${paymentLink} and sent to the customer.`;
+              break;
+            }
+
+            default:
+              toolOutput = `Unknown tool: ${toolCall.name}`;
+              break;
           }
-
-          default:
-            toolOutput = `Unknown tool: ${toolCall.name}`;
-            break;
+        } catch (err: any) {
+          console.error('[Claude Brain] Error executing tool:', err);
+          toolOutput = `Error executing tool: ${err.message}`;
         }
-      } catch (err: any) {
-        console.error('[Claude Brain] Error executing tool:', err);
-        toolOutput = `Error executing tool: ${err.message}`;
+
+        console.log(`[Claude Brain] Tool execution results: ${toolOutput}`);
+
+        // Feed tool output back to Claude
+        messageHistory.push({
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: toolCall.id,
+              content: toolOutput,
+            },
+          ],
+        });
+      } else {
+        // Claude returned a final speech response
+        const textBlock = response.content.find((c) => c.type === 'text');
+        finalResponseText = textBlock && textBlock.type === 'text' ? textBlock.text : 'I did not catch that. Can you repeat?';
+        break;
       }
+    }
 
-      console.log(`[Claude Brain] Tool execution results: ${toolOutput}`);
+    // 4. Update the call logs transcript in database
+    transcriptList.push({ role: 'ai', text: finalResponseText, time: new Date().toISOString() });
 
-      // Feed tool output back to Claude
-      messageHistory.push({
-        role: 'user',
-        content: [
-          {
-            type: 'tool_result',
-            tool_use_id: toolCall.id,
-            content: toolOutput,
-          },
-        ],
+    if (callLog) {
+      await prisma.callLog.update({
+        where: { id: callLog.id },
+        data: { transcript: transcriptList },
       });
     } else {
-      // Claude returned a final speech response
-      const textBlock = response.content.find((c) => c.type === 'text');
-      finalResponseText = textBlock && textBlock.type === 'text' ? textBlock.text : 'I did not catch that. Can you repeat?';
-      break;
+      // Scaffold call log entry if somehow missing
+      await prisma.callLog.create({
+        data: {
+          id: sessionId,
+          sessionId: session.id,
+          transcript: transcriptList,
+        },
+      });
     }
+
+    return finalResponseText;
+  } catch (err: any) {
+    console.warn(`[Claude Brain] Anthropic API cycle failed due to credit limits or network issues. Falling back to high-fidelity Hinglish NLP agent! Error: ${err.message}`);
+    return executeOfflineFallback();
   }
-
-  // 4. Update the call logs transcript in database
-  transcriptList.push({ role: 'ai', text: finalResponseText, time: new Date().toISOString() });
-
-  if (callLog) {
-    await prisma.callLog.update({
-      where: { id: callLog.id },
-      data: { transcript: transcriptList },
-    });
-  } else {
-    // Scaffold call log entry if somehow missing
-    await prisma.callLog.create({
-      data: {
-        id: sessionId,
-        sessionId: session.id,
-        transcript: transcriptList,
-      },
-    });
-  }
-
-  return finalResponseText;
 }
