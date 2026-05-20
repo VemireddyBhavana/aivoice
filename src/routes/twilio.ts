@@ -12,7 +12,7 @@ twilioRouter.post('/voice', (req, res) => {
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Aditi-Neural" language="en-IN">Welcome to the AI ordering desk. How can I help you today?</Say>
+  <Say voice="Polly.Aditi" language="en-IN">Welcome to the AI ordering desk. How can I help you today?</Say>
   <Connect>
     <Stream url="${streamUrl}">
       <Parameter name="from" value="${callerNumber}" />
